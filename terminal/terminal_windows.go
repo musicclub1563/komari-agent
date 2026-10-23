@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 
 	"github.com/UserExistsError/conpty"
 )
@@ -47,19 +48,25 @@ func newTerminalImpl() (*terminalImpl, error) {
 }
 
 type windowsTerminal struct {
-	tty    *conpty.ConPty
+	tty *conpty.ConPty
+
+	mu     sync.Mutex
 	closed bool
 }
 
+// Close 关闭 ConPTY 并释放其管道句柄。重复或并发调用是安全的，
+// 只有第一次调用会真正关闭底层资源。
 func (t *windowsTerminal) Close() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if t.closed {
 		return nil
 	}
-	if err := t.tty.Close(); err != nil {
-		return err
-	}
 	t.closed = true
-	return nil
+	if t.tty == nil {
+		return nil
+	}
+	return t.tty.Close()
 }
 
 func (t *windowsTerminal) Read(p []byte) (int, error) {
@@ -75,6 +82,11 @@ func (t *windowsTerminal) Resize(cols, rows int) error {
 }
 
 func (t *windowsTerminal) Wait() error {
-	_, err := t.tty.Wait(context.Background())
+	if t.tty == nil {
+		return fmt.Errorf("tty is nil")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), closeGracePeriod)
+	defer cancel()
+	_, err := t.tty.Wait(ctx)
 	return err
 }

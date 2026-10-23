@@ -16,6 +16,9 @@ var flags = pkg_flags.GlobalConfig
 // 与 Server 端会话保留窗口对齐，网络恢复后同一会话可重新附着。
 const disconnectedRetention = 5 * time.Minute
 
+// closeGracePeriod 是等待终端进程退出的上限，超时后强制结束。
+const closeGracePeriod = 5 * time.Second
+
 // Terminal 接口定义平台特定的终端操作
 type Terminal interface {
 	Close() error

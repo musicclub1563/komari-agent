@@ -137,7 +137,7 @@ func executeFileOperation(operation v2.FileOperation) (json.RawMessage, error) {
 }
 
 func listFiles(root string) (json.RawMessage, error) {
-	if runtime.GOOS == "windows" && strings.TrimSpace(root) == "/" {
+	if runtime.GOOS == "windows" && root == "/" {
 		return listVirtualRootEntries()
 	}
 	root = resolveFilePath(root)
@@ -330,32 +330,79 @@ func copyPath(source, destination string) (json.RawMessage, error) {
 	return json.Marshal(map[string]any{"copied": true})
 }
 
+// ensureDistinctFile rejects a copy whose destination already refers to the
+// source inode. Path comparison alone misses aliases: hard links, a symlink
+// pointing at the source, bind mounts or junctions all resolve to the same
+// file, and truncating that file would destroy the data being copied.
+func ensureDistinctFile(source, destination string) error {
+	sourceInfo, err := os.Stat(source)
+	if err != nil {
+		return err
+	}
+	destinationInfo, err := os.Stat(destination)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if os.SameFile(sourceInfo, destinationInfo) {
+		return fmt.Errorf("source %q and destination %q are the same file", source, destination)
+	}
+	return nil
+}
+
+// copyRegularFile stages the copy in a temporary file next to the destination
+// and only then commits it with a rename. A failed copy therefore leaves an
+// existing destination untouched instead of truncating it up front, and the
+// rename replaces symlinks at the destination instead of writing through them.
 func copyRegularFile(source, destination string, info os.FileInfo) error {
+	if err := ensureDistinctFile(source, destination); err != nil {
+		return err
+	}
+	directory := filepath.Dir(destination)
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		return err
+	}
 	input, err := os.Open(source)
 	if err != nil {
 		return err
 	}
 	defer input.Close()
-	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
-		return err
-	}
-	output, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, info.Mode().Perm())
+
+	output, err := os.CreateTemp(directory, ".komari-copy-*")
 	if err != nil {
 		return err
 	}
-	if _, err = io.Copy(output, input); err != nil {
+	temporaryName := output.Name()
+	committed := false
+	defer func() {
 		_ = output.Close()
-		_ = os.Remove(destination)
+		if !committed {
+			_ = os.Remove(temporaryName)
+		}
+	}()
+
+	if _, err := io.Copy(output, input); err != nil {
 		return err
 	}
-	if err = output.Close(); err != nil {
-		_ = os.Remove(destination)
+	if err := output.Chmod(info.Mode().Perm()); err != nil {
 		return err
 	}
-	if err = os.Chmod(destination, info.Mode().Perm()); err != nil {
+	if err := output.Sync(); err != nil {
 		return err
 	}
-	return os.Chtimes(destination, info.ModTime(), info.ModTime())
+	if err := output.Close(); err != nil {
+		return err
+	}
+	if err := os.Chtimes(temporaryName, info.ModTime(), info.ModTime()); err != nil {
+		return err
+	}
+	if err := replaceFile(temporaryName, destination); err != nil {
+		return err
+	}
+	committed = true
+	return nil
 }
 
 func copySymlink(source, destination string) error {
@@ -369,6 +416,13 @@ func copySymlink(source, destination string) error {
 	if existing, err := os.Lstat(destination); err == nil {
 		if existing.IsDir() && existing.Mode()&os.ModeSymlink == 0 {
 			return errors.New("cannot replace destination directory with a symlink")
+		}
+		// Removing a plain file that happens to be the target of the source
+		// symlink would destroy the data the link points at.
+		if existing.Mode()&os.ModeSymlink == 0 {
+			if targetInfo, statErr := os.Stat(source); statErr == nil && os.SameFile(existing, targetInfo) {
+				return fmt.Errorf("source symlink %q points at destination %q", source, destination)
+			}
 		}
 		if err := os.Remove(destination); err != nil {
 			return err
@@ -476,7 +530,7 @@ func searchFiles(args map[string]interface{}) (json.RawMessage, error) {
 	}
 
 	var roots []string
-	if runtime.GOOS == "windows" && strings.TrimSpace(argString(args, "path")) == "/" {
+	if runtime.GOOS == "windows" && argString(args, "path") == "/" {
 		roots = virtualRootSearchPaths()
 	} else {
 		roots = []string{resolveFilePath(argString(args, "path"))}
@@ -580,8 +634,10 @@ func cancelFileUpload(args map[string]interface{}) (json.RawMessage, error) {
 		writeLock.Unlock()
 		forgetUploadWriteLock(uploadID)
 	}()
-	targetPath := strings.TrimSpace(argString(args, "path"))
+	targetPath := argString(args, "path")
 	if targetPath != "" {
+		// Never normalise whitespace here: the path identifies a part file that
+		// may legitimately contain leading or trailing spaces.
 		targetPath = resolveFilePath(targetPath)
 	}
 
@@ -844,21 +900,28 @@ func postFileResult(result v2.FileResult) {
 	}
 }
 
+// resolveFilePath maps a path received over RPC (or echoed back from a file
+// listing) onto an OS path.
+//
+// The bytes of the path are preserved: only separators and "." / ".." elements
+// are normalised by filepath.Clean. Leading and trailing spaces are significant
+// characters in a file name on every supported platform, so trimming them here
+// would silently redirect an operation at a different file (for example
+// "report " -> "report"). Human-friendly whitespace cleanup belongs to the
+// input widget, before the request is sent; the agent treats RPC paths as exact.
 func resolveFilePath(path string) string {
-	trimmed := strings.TrimSpace(path)
-	if trimmed == "" {
-		trimmed = "/"
+	if path == "" {
+		path = "/"
 	}
-	if trimmed == "~" || strings.HasPrefix(trimmed, "~/") || strings.HasPrefix(trimmed, `~\`) {
+	if path == "~" || strings.HasPrefix(path, "~/") || strings.HasPrefix(path, `~\`) {
 		if home, err := os.UserHomeDir(); err == nil && home != "" {
-			if trimmed == "~" {
+			if path == "~" {
 				return resolveOSPath(home)
 			}
-			return resolveOSPath(filepath.Join(home, trimmed[2:]))
+			return resolveOSPath(filepath.Join(home, path[2:]))
 		}
 	}
-	resolved := filepath.Clean(trimmed)
-	return resolveOSPath(resolved)
+	return resolveOSPath(filepath.Clean(path))
 }
 
 func virtualizeFilePath(path string) string {

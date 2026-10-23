@@ -420,7 +420,7 @@ func writeUploadStreamChunk(spec uploadStreamSpec, source io.Reader) (json.RawMe
 		uploadChunksMu.Unlock()
 		return nil, errors.New("unknown upload session")
 	}
-	if state.TargetPath != "" && filepath.Clean(state.TargetPath) != filepath.Clean(spec.Path) {
+	if state.TargetPath != "" && !samePath(state.TargetPath, spec.Path) {
 		uploadChunksMu.Unlock()
 		return nil, errors.New("upload target path does not match session")
 	}

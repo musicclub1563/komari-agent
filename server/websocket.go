@@ -34,14 +34,32 @@ const (
 	v2SeenEventLimit = 4096
 )
 
+// wsSession couples a live connection with the done channel of its reader.
+// Cleanup always targets the connection the channel belongs to, so a stale
+// session can never tear down a newer connection.
+type wsSession struct {
+	conn *ws.SafeConn
+	done chan struct{}
+}
+
+func newWSSession(conn *ws.SafeConn, onRestartRequired func()) *wsSession {
+	done := make(chan struct{})
+	go handleWebSocketMessages(conn, done, onRestartRequired)
+	return &wsSession{conn: conn, done: done}
+}
+
+func (s *wsSession) close() {
+	if s == nil || s.conn == nil {
+		return
+	}
+	_ = s.conn.Close()
+}
+
 func EstablishWebSocketConnection(onRestartRequired func()) {
-	var conn *ws.SafeConn
+	var session *wsSession
 	defer func() {
-		if conn != nil {
-			conn.Close()
-		}
+		session.close()
 	}()
-	var err error
 	interval := math.Max(1, flags.Interval)
 
 	// Connection recovery must not wait for the (possibly much longer) report
@@ -54,12 +72,16 @@ func EstablishWebSocketConnection(onRestartRequired func()) {
 	heartbeatTicker := time.NewTicker(30 * time.Second)
 	defer heartbeatTicker.Stop()
 
-	var readDone <-chan struct{}
-
 	for {
+		// A nil channel blocks forever, which detaches a dropped session from
+		// the select without needing extra state.
+		var readDone <-chan struct{}
+		if session != nil {
+			readDone = session.done
+		}
 		select {
 		case <-dataTicker.C:
-			if conn == nil {
+			if session == nil {
 				log.Println("Attempting to connect to WebSocket...")
 				retry := 0
 				for retry <= flags.MaxRetries {
@@ -67,64 +89,53 @@ func EstablishWebSocketConnection(onRestartRequired func()) {
 						log.Println("Retrying websocket connection, attempt:", retry)
 					}
 					websocketEndpoint := buildWebSocketEndpoint()
-					conn, err = connectWebSocket(websocketEndpoint)
+					conn, err := connectWebSocket(websocketEndpoint)
 					if err == nil {
 						log.Println("WebSocket connected using v2 protocol")
-						done := make(chan struct{})
-						readDone = done
-						go handleWebSocketMessages(conn, done, onRestartRequired)
+						session = newWSSession(conn, onRestartRequired)
 						break
-					} else {
-						log.Println("Failed to connect to WebSocket:", err)
 					}
+					log.Println("Failed to connect to WebSocket:", err)
 					retry++
 					time.Sleep(time.Duration(flags.ReconnectInterval) * time.Second)
 				}
 
-				if retry > flags.MaxRetries {
+				if session == nil && retry > flags.MaxRetries {
 					log.Println("Max retries reached.")
-					conn, err = runPostFallback(buildWebSocketEndpoint(), interval, onRestartRequired)
-					if err != nil {
-						log.Println("POST fallback stopped:", err)
+					conn, fallbackErr := runPostFallback(buildWebSocketEndpoint(), interval, onRestartRequired)
+					if fallbackErr != nil {
+						log.Println("POST fallback stopped:", fallbackErr)
 						return
 					}
 					log.Println("WebSocket recovered from POST fallback")
-					done := make(chan struct{})
-					readDone = done
-					go handleWebSocketMessages(conn, done, onRestartRequired)
+					session = newWSSession(conn, onRestartRequired)
 				}
 			}
-			if conn == nil || time.Now().Before(nextReportAt) {
+			if session == nil || time.Now().Before(nextReportAt) {
 				continue
 			}
 			nextReportAt = time.Now().Add(reportInterval)
 
 			data := v2.BuildReportPayload(monitoring.GenerateReport())
-			err = conn.WriteMessage(websocket.TextMessage, data)
-			if err != nil {
+			if err := session.conn.WriteMessage(websocket.TextMessage, data); err != nil {
 				log.Println("Failed to send WebSocket message:", err)
-				conn.Close()
-				conn = nil // Mark connection as dead
-				readDone = nil
+				session.close()
+				session = nil // Mark connection as dead
 				continue
 			}
 		case <-heartbeatTicker.C:
-			if conn != nil {
-				err := conn.WriteMessage(websocket.PingMessage, nil)
-				if err != nil {
-					log.Println("Failed to send heartbeat:", err)
-					conn.Close()
-					conn = nil // Mark connection as dead
-					readDone = nil
-				}
+			if session == nil {
+				continue
+			}
+			if err := session.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				log.Println("Failed to send heartbeat:", err)
+				session.close()
+				session = nil // Mark connection as dead
 			}
 		case <-readDone:
 			log.Println("WebSocket disconnected")
-			if conn != nil {
-				conn.Close()
-				conn = nil
-			}
-			readDone = nil
+			session.close()
+			session = nil
 		}
 	}
 }
