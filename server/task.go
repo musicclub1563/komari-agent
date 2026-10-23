@@ -34,9 +34,17 @@ func NewTask(task_id, command string) {
 		uploadTaskResult(task_id, "Remote control is disabled.", -1, time.Now())
 		return
 	}
-	log.Printf("Executing task %s with command: %s", task_id, command)
+	logTaskExecution(task_id, command)
 	result, exitCode := runTaskCommand(command)
 	uploadTaskResult(task_id, result, exitCode, time.Now())
+}
+
+// logTaskExecution records that a task ran without writing the command body to
+// the log. Commands routinely carry credentials, tokens and connection strings
+// in their arguments, and the log is readable by anyone who can read the
+// service journal.
+func logTaskExecution(taskID, command string) {
+	log.Printf("Executing task %s (command %d bytes)", taskID, len(command))
 }
 
 func runTaskCommand(command string) (string, int) {
@@ -123,7 +131,7 @@ func uploadTaskResult(taskID, result string, exitCode int, finishedAt time.Time)
 		},
 	}
 	if err := postV2RPC(payload); err != nil {
-		log.Printf("Failed to upload task result: %v", err)
+		logError("Failed to upload task result", err)
 	}
 }
 
@@ -314,7 +322,7 @@ func NewPingTask(conn *ws.SafeConn, taskID uint, pingType, pingTarget string) {
 	//}
 	if conn == nil {
 		if err := postV2RPC(wsPayload); err != nil {
-			log.Printf("Failed to upload ping result over POST: %v", err)
+			logError("Failed to upload ping result over POST", err)
 		}
 		return
 	}
@@ -329,7 +337,7 @@ func postV2RPC(payload interface{}) error {
 	if err != nil {
 		return err
 	}
-	endpoint := strings.TrimSuffix(flags.Endpoint, "/") + "/api/clients/v2/rpc?token=" + flags.Token
+	endpoint := buildAgentURL(flags.Endpoint, "/api/clients/v2/rpc", map[string]string{"token": flags.Token})
 	compressed := false
 	if !flags.DisableCompression {
 		if gz, err := gzipBytes(body); err == nil {

@@ -10,7 +10,6 @@ import (
 	"log"
 	"math"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -95,7 +94,7 @@ func EstablishWebSocketConnection(onRestartRequired func()) {
 						session = newWSSession(conn, onRestartRequired)
 						break
 					}
-					log.Println("Failed to connect to WebSocket:", err)
+					logError("Failed to connect to WebSocket", err)
 					retry++
 					time.Sleep(time.Duration(flags.ReconnectInterval) * time.Second)
 				}
@@ -104,7 +103,7 @@ func EstablishWebSocketConnection(onRestartRequired func()) {
 					log.Println("Max retries reached.")
 					conn, fallbackErr := runPostFallback(buildWebSocketEndpoint(), interval, onRestartRequired)
 					if fallbackErr != nil {
-						log.Println("POST fallback stopped:", fallbackErr)
+						logError("POST fallback stopped", fallbackErr)
 						return
 					}
 					log.Println("WebSocket recovered from POST fallback")
@@ -141,12 +140,12 @@ func EstablishWebSocketConnection(onRestartRequired func()) {
 }
 
 func buildWebSocketEndpoint() string {
-	websocketEndpoint := strings.TrimSuffix(flags.Endpoint, "/") + "/api/clients/v2/rpc?token=" + flags.Token
-	websocketEndpoint = "ws" + strings.TrimPrefix(websocketEndpoint, "http")
+	websocketEndpoint := buildAgentWebSocketURL(flags.Endpoint, "/api/clients/v2/rpc",
+		map[string]string{"token": flags.Token})
 	if convertedEndpoint, err := utils.ConvertIDNToASCII(websocketEndpoint); err == nil {
 		return convertedEndpoint
 	} else {
-		log.Printf("Warning: Failed to convert WebSocket IDN to ASCII: %v", err)
+		logError("Warning: failed to convert WebSocket IDN to ASCII", err)
 	}
 	return websocketEndpoint
 }
@@ -169,7 +168,7 @@ func runPostFallback(websocketEndpoint string, interval float64, onRestartRequir
 			ackIDs := snapshotV2AckEventIDs()
 			resp, err := postV2Request(v2.BuildReportRequest(reportID, monitoring.GenerateReport(), ackIDs))
 			if err != nil {
-				log.Println("Failed to POST v2 report:", err)
+				logError("Failed to POST v2 report", err)
 				continue
 			}
 			clearV2AckEventIDs(ackIDs)
@@ -179,7 +178,7 @@ func runPostFallback(websocketEndpoint string, interval float64, onRestartRequir
 			if err == nil {
 				return conn, nil
 			}
-			log.Println("POST fallback WebSocket recovery failed:", err)
+			logError("POST fallback WebSocket recovery failed", err)
 		}
 	}
 }
@@ -202,7 +201,7 @@ func runV2PullLoop(ctx context.Context, onRestartRequired func()) {
 			if ctx.Err() != nil {
 				return
 			}
-			log.Println("Failed to POST v2 pull:", err)
+			logError("Failed to POST v2 pull", err)
 			timer := time.NewTimer(time.Duration(flags.ReconnectInterval) * time.Second)
 			select {
 			case <-ctx.Done():
@@ -222,7 +221,7 @@ func postV2Request(payload []byte) (*v2.Response, error) {
 }
 
 func postV2RequestContext(ctx context.Context, payload []byte) (*v2.Response, error) {
-	endpoint := strings.TrimSuffix(flags.Endpoint, "/") + "/api/clients/v2/rpc?token=" + flags.Token
+	endpoint := buildAgentURL(flags.Endpoint, "/api/clients/v2/rpc", map[string]string{"token": flags.Token})
 	body := payload
 	compressed := false
 	if !flags.DisableCompression {
@@ -450,14 +449,14 @@ func processV2Event(conn *ws.SafeConn, method string, params interface{}, eventI
 
 // establishTerminalConnection 建立终端连接并使用terminal包处理终端操作
 func establishTerminalConnection(token, id, endpoint string) {
-	endpoint = strings.TrimSuffix(endpoint, "/") + "/api/clients/terminal?token=" + token + "&id=" + id
-	endpoint = "ws" + strings.TrimPrefix(endpoint, "http")
+	endpoint = buildAgentWebSocketURL(endpoint, "/api/clients/terminal",
+		map[string]string{"token": token, "id": id})
 
 	// 转换中文域名为 ASCII 兼容编码
 	if convertedEndpoint, err := utils.ConvertIDNToASCII(endpoint); err == nil {
 		endpoint = convertedEndpoint
 	} else {
-		log.Printf("Warning: Failed to convert Terminal WebSocket IDN to ASCII: %v", err)
+		logError("Warning: failed to convert terminal WebSocket IDN to ASCII", err)
 	}
 
 	// 使用与主 WS 相同的拨号策略
@@ -465,7 +464,7 @@ func establishTerminalConnection(token, id, endpoint string) {
 
 	conn, _, err := dialer.Dial(endpoint, nil)
 	if err != nil {
-		log.Println("Failed to establish terminal connection:", err)
+		logError("Failed to establish terminal connection", err)
 		return
 	}
 

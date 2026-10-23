@@ -5,7 +5,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/komari-monitor/komari-agent/dnsresolver"
@@ -24,14 +23,14 @@ func DoUploadBasicInfoWorks() {
 	for range ticker.C {
 		err := uploadBasicInfo()
 		if err != nil {
-			log.Println("Error uploading basic info:", err)
+			logError("Error uploading basic info", err)
 		}
 	}
 }
 func UpdateBasicInfo() {
 	err := uploadBasicInfo()
 	if err != nil {
-		log.Println("Error uploading basic info:", err)
+		logError("Error uploading basic info", err)
 	} else {
 		log.Println("Basic info uploaded successfully")
 	}
@@ -68,7 +67,7 @@ func tryUploadData(data map[string]interface{}) error {
 }
 
 func tryUploadDataWithProtocol(data map[string]interface{}) error {
-	endpoint := strings.TrimSuffix(flags.Endpoint, "/") + "/api/clients/v2/rpc?token=" + flags.Token
+	endpoint := buildAgentURL(flags.Endpoint, "/api/clients/v2/rpc", map[string]string{"token": flags.Token})
 	payload := v2.BuildBasicInfoPayload(data)
 	body := payload
 	compressed := false

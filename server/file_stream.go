@@ -136,7 +136,9 @@ func sendDownloadStream(args map[string]interface{}) (json.RawMessage, error) {
 
 	response, err := fileStreamHTTPClient().Do(request)
 	if err != nil {
-		return nil, fmt.Errorf("download_stream: HTTP request: %w", err)
+		// net/http embeds the request URL (token in query) in its error; this
+		// string is both logged and returned to the server.
+		return nil, fmt.Errorf("download_stream: HTTP request: %s", redactError(err))
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
@@ -186,7 +188,7 @@ func receiveUploadStream(args map[string]interface{}) (json.RawMessage, error) {
 	request.Header.Set("X-Komari-Transfer-Length", fmt.Sprintf("%d", spec.Expected))
 	response, err := fileStreamHTTPClient().Do(request)
 	if err != nil {
-		return nil, fmt.Errorf("upload_stream: HTTP request: %w", err)
+		return nil, fmt.Errorf("upload_stream: HTTP request: %s", redactError(err))
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {

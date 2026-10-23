@@ -862,15 +862,14 @@ func matchFileContent(path, query, lowerQuery string) (searchMatch, bool) {
 }
 
 func postFileResult(result v2.FileResult) {
-	endpoint := strings.TrimSuffix(flags.Endpoint, "/") +
-		"/api/clients/v2/rpc?token=" + flags.Token
+	endpoint := buildAgentURL(flags.Endpoint, "/api/clients/v2/rpc", map[string]string{"token": flags.Token})
 	body := v2.NewRequest(nil, v2.MethodAgentFileResult, result)
 	client := dnsresolver.GetHTTPClientWithPreference(60*time.Second, flags.PreferIPVersion)
 	const maxAttempts = 4
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
 		if err != nil {
-			log.Printf("failed to create file result request: %v", err)
+			logError("failed to create file result request", err)
 			return
 		}
 		req.Header.Set("Content-Type", "application/json")
@@ -893,7 +892,7 @@ func postFileResult(result v2.FileResult) {
 			continue
 		}
 		if err != nil {
-			log.Printf("failed to return file result: %v", err)
+			logError("failed to return file result", err)
 		} else if response != nil {
 			log.Printf("file result endpoint returned %s", response.Status)
 		}
