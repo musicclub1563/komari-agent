@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+	"golang.org/x/sys/unix"
 )
 
 // startTestTerminal launches a controlled child inside a real PTY. Tests never
@@ -26,7 +27,10 @@ func startTestTerminal(t *testing.T, script string) *unixTerminal {
 	if err != nil {
 		t.Skipf("pty unavailable: %v", err)
 	}
-	term := &unixTerminal{tty: tty, cmd: cmd, waitDone: make(chan struct{})}
+	// 与 newTerminalImpl 保持一致：保存原始 fd 并保持非阻塞模式。
+	fd := int(tty.Fd())
+	_ = unix.SetNonblock(fd, true)
+	term := &unixTerminal{tty: tty, cmd: cmd, fd: fd, waitDone: make(chan struct{})}
 	t.Cleanup(func() {
 		// Close is idempotent, so this is a no-op when the test already closed.
 		_ = term.Close()
@@ -39,7 +43,8 @@ func startTestTerminal(t *testing.T, script string) *unixTerminal {
 // instead of relying on garbage collection.
 func TestUnixTerminalCloseReleasesPTYAndReapsProcess(t *testing.T) {
 	term := startTestTerminal(t, "sleep 30")
-	fd := term.tty.Fd()
+	// 使用保存的原始 fd：os.File.Fd() 会把 fd 切回阻塞模式。
+	fd := term.fd
 
 	start := time.Now()
 	if err := term.Close(); err != nil {
@@ -50,7 +55,7 @@ func TestUnixTerminalCloseReleasesPTYAndReapsProcess(t *testing.T) {
 	}
 
 	var stat syscall.Stat_t
-	if err := syscall.Fstat(int(fd), &stat); err != syscall.EBADF {
+	if err := syscall.Fstat(fd, &stat); err != syscall.EBADF {
 		t.Fatalf("pty master fd %d is still open after Close (err=%v)", fd, err)
 	}
 	if term.cmd.ProcessState == nil {

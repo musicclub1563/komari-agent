@@ -19,6 +19,23 @@ const disconnectedRetention = 5 * time.Minute
 // closeGracePeriod 是等待终端进程退出的上限，超时后强制结束。
 const closeGracePeriod = 5 * time.Second
 
+// inputWriteTimeout 是单次终端输入写入的硬上限。
+//
+// 前台进程停止消费输入时（例如 sleep、卡死的交互程序），PTY 输入缓冲区
+// 写满后 write(2) 会一直阻塞。写入超时说明会话已经无法可靠地继续使用，
+// 必须明确终止会话并回收进程与资源，而不是无限期等待。
+const inputWriteTimeout = 3 * time.Second
+
+// gracefulShutdownBudget 约束整个优雅退出阶段（Ctrl-C / Ctrl-D / exit）的
+// 总时长；gracefulWriteTimeout 约束其中单次控制字符写入。
+//
+// 优雅退出只是"尽力而为"：一旦 PTY 不可写（例如前台进程停止消费输入），
+// 立即放弃并转入强制关闭路径（进程组终止 + PTY 释放）。
+const (
+	gracefulShutdownBudget = 1500 * time.Millisecond
+	gracefulWriteTimeout   = 250 * time.Millisecond
+)
+
 // Terminal 接口定义平台特定的终端操作
 type Terminal interface {
 	Close() error
@@ -36,13 +53,25 @@ type terminalImpl struct {
 }
 
 type terminalSession struct {
-	id   string
-	term Terminal
+	id     string
+	term   Terminal
+	writer *ptyWriter
 
 	mu      sync.Mutex
 	conn    *websocket.Conn
 	timer   *time.Timer
 	removed bool
+
+	teardownOnce sync.Once
+}
+
+// newTerminalSession 创建一个会话并启动其唯一的 PTY 写入者。
+func newTerminalSession(id string, term Terminal) *terminalSession {
+	return &terminalSession{
+		id:     id,
+		term:   term,
+		writer: newPtyWriter(term),
+	}
 }
 
 var (
@@ -80,7 +109,7 @@ func StartTerminal(conn *websocket.Conn, requestID string) {
 
 func acquireSession(requestID string, conn *websocket.Conn) (*terminalSession, bool, error) {
 	sessionsMu.Lock()
-	var orphanTerm Terminal
+	var orphan *terminalSession
 	session := sessions[requestID]
 	firstConnection := false
 	if session == nil {
@@ -90,15 +119,16 @@ func acquireSession(requestID string, conn *websocket.Conn) (*terminalSession, b
 		if err != nil {
 			return nil, false, err
 		}
-		session = &terminalSession{id: requestID, term: impl.term}
+		candidate := newTerminalSession(requestID, impl.term)
 
 		sessionsMu.Lock()
 		if sessions[requestID] != nil {
+			// 竞态：另一个连接已经创建了同 ID 的会话，候选会话立即回收。
 			session = sessions[requestID]
-			orphan := impl.term
-			orphanTerm = orphan
+			orphan = candidate
 		} else {
-			sessions[requestID] = session
+			sessions[requestID] = candidate
+			session = candidate
 			firstConnection = true
 		}
 	}
@@ -114,8 +144,8 @@ func acquireSession(requestID string, conn *websocket.Conn) (*terminalSession, b
 	session.mu.Unlock()
 	sessionsMu.Unlock()
 
-	if orphanTerm != nil {
-		go gracefulClose(orphanTerm)
+	if orphan != nil {
+		go orphan.teardown()
 	}
 
 	if oldConn != nil && oldConn != conn {
@@ -133,7 +163,7 @@ func (s *terminalSession) handleInput(conn *websocket.Conn) {
 		}
 
 		if messageType == websocket.BinaryMessage {
-			_, _ = s.term.Write(data)
+			s.writeInput(data)
 			continue
 		}
 
@@ -144,7 +174,7 @@ func (s *terminalSession) handleInput(conn *websocket.Conn) {
 			Input string `json:"input,omitempty"`
 		}
 		if json.Unmarshal(data, &cmd) != nil {
-			_, _ = s.term.Write(data)
+			s.writeInput(data)
 			continue
 		}
 		switch cmd.Type {
@@ -154,13 +184,27 @@ func (s *terminalSession) handleInput(conn *websocket.Conn) {
 			}
 		case "input":
 			if cmd.Input != "" {
-				_, _ = s.term.Write([]byte(cmd.Input))
+				s.writeInput([]byte(cmd.Input))
 			}
 		case "heartbeat":
 		case "close":
 			closeSession(s.id, s)
 			return
 		}
+	}
+}
+
+// writeInput 将终端输入交给会话唯一的 PTY 写入者，并施加硬超时。
+//
+// 写入失败或超时时说明前台进程已经停止消费输入，PTY 写入处于阻塞状态，
+// 会话不再可靠：立即整体回收（终止进程组、释放 PTY、回收写入者）。
+// 结果未知的输入绝不重放，避免命令被重复执行。
+func (s *terminalSession) writeInput(data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	if _, err := s.writer.write(data, inputWriteTimeout); err != nil {
+		closeSession(s.id, s)
 	}
 }
 
@@ -222,32 +266,76 @@ func closeSession(requestID string, expected *terminalSession) {
 	}
 	conn := session.conn
 	session.conn = nil
-	term := session.term
 	session.mu.Unlock()
 
 	if conn != nil {
 		_ = conn.Close()
 	}
-	_ = gracefulClose(term)
+	session.teardown()
 }
 
-func gracefulClose(term Terminal) error {
-	gracefulShutdown(term)
-	return term.Close()
+// teardown 是会话的最终回收路径，顺序固定：
+//
+//  1. 有界的优雅退出（Ctrl-C / Ctrl-D / exit），总时长受预算约束；
+//  2. 强制关闭终端：终止进程组、必要时 SIGKILL，并主动释放 PTY 主描述符
+//     —— 释放 PTY 同时解除写入者可能阻塞中的底层 Write；
+//  3. 停止并等待写入者退出，保证不遗留后台写入协程。
+//
+// 三个步骤都有时间上限，因此即使 PTY 完全写不动，关闭也能在有限时间内完成。
+func (s *terminalSession) teardown() {
+	s.teardownOnce.Do(func() {
+		gracefulShutdown(s)
+		_ = s.term.Close()
+		s.writer.stopAndWait(closeGracePeriod)
+	})
 }
 
-// gracefulShutdown 尝试优雅地关闭终端
-func gracefulShutdown(term Terminal) {
-	for i := 0; i < 3; i++ {
-		if _, err := term.Write([]byte{3}); err != nil {
-			return
+// gracefulShutdown 尝试让 shell 自行退出（Ctrl-C ×3、Ctrl-D、exit）。
+//
+// 每次写入和整个阶段都有时间上限：PTY 不可写（例如前台进程停止消费输入，
+// 写入一直阻塞）时立即放弃，转入 teardown 的强制关闭路径。
+func gracefulShutdown(s *terminalSession) {
+	deadline := time.Now().Add(gracefulShutdownBudget)
+
+	writeControl := func(data []byte) bool {
+		timeout := time.Until(deadline)
+		if timeout <= 0 {
+			return false
 		}
-		time.Sleep(50 * time.Millisecond)
+		if timeout > gracefulWriteTimeout {
+			timeout = gracefulWriteTimeout
+		}
+		_, err := s.writer.write(data, timeout)
+		return err == nil
 	}
 
-	time.Sleep(200 * time.Millisecond)
-	_, _ = term.Write([]byte{4})
-	time.Sleep(100 * time.Millisecond)
-	_, _ = term.Write([]byte("exit\n"))
-	time.Sleep(100 * time.Millisecond)
+	sleepBounded := func(d time.Duration) bool {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return false
+		}
+		if d > remaining {
+			d = remaining
+		}
+		time.Sleep(d)
+		return true
+	}
+
+	for i := 0; i < 3; i++ {
+		if !writeControl([]byte{3}) {
+			return
+		}
+		if !sleepBounded(50 * time.Millisecond) {
+			return
+		}
+	}
+	if !sleepBounded(200 * time.Millisecond) {
+		return
+	}
+	_ = writeControl([]byte{4})
+	if !sleepBounded(100 * time.Millisecond) {
+		return
+	}
+	_ = writeControl([]byte("exit\n"))
+	sleepBounded(100 * time.Millisecond)
 }
