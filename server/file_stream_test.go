@@ -32,7 +32,7 @@ func resetUploadStreamState(t *testing.T) {
 	uploadChunks = make(map[string]uploadChunkState)
 	uploadChunksMu.Unlock()
 	uploadWriteLocksMu.Lock()
-	uploadWriteLocks = make(map[string]*sync.Mutex)
+	uploadWriteLocks = make(map[string]*uploadWriteLockEntry)
 	uploadWriteLocksMu.Unlock()
 	uploadLifecycleMu.Lock()
 	uploadLifecycles = make(map[string]*uploadStreamLifecycle)

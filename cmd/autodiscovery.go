@@ -84,11 +84,25 @@ func saveAutoDiscoveryConfig(config *AutoDiscoveryConfig) error {
 	}
 
 	// 写入文件
-	if err := os.WriteFile(configPath, data, 0644); err != nil {
-		return fmt.Errorf("failed to write auto-discovery config: %v", err)
+	if err := writeAutoDiscoveryConfig(configPath, data); err != nil {
+		return err
 	}
 
 	log.Printf("Auto-discovery config saved to: %s", configPath)
+	return nil
+}
+
+// writeAutoDiscoveryConfig stores the client token with owner-only permissions.
+// The file carries a credential that grants remote control of this host, so it
+// must never be group- or world-readable. os.WriteFile only applies perm when
+// the file is created, so an existing file is tightened explicitly.
+func writeAutoDiscoveryConfig(path string, data []byte) error {
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return fmt.Errorf("failed to write auto-discovery config: %v", err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return fmt.Errorf("failed to restrict auto-discovery config permissions: %v", err)
+	}
 	return nil
 }
 

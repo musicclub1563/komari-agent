@@ -28,7 +28,7 @@ const (
 var (
 	fileStreamBufferPool = sync.Pool{New: func() any { return make([]byte, fileStreamBufferSize) }}
 	uploadWriteLocksMu   sync.Mutex
-	uploadWriteLocks     = make(map[string]*sync.Mutex)
+	uploadWriteLocks     = make(map[string]*uploadWriteLockEntry)
 	uploadLifecycleMu    sync.Mutex
 	uploadLifecycles     = make(map[string]*uploadStreamLifecycle)
 	fileStreamSlots      = make(chan struct{}, maxFileStreamOperations)
@@ -155,6 +155,7 @@ func receiveUploadStream(args map[string]interface{}) (json.RawMessage, error) {
 	if err != nil {
 		return nil, fmt.Errorf("upload_stream: invalid metadata: %w", err)
 	}
+	ensureUploadReaper()
 	transferURL, err := buildFileTransferURL(args)
 	if err != nil {
 		return nil, fmt.Errorf("upload_stream: build transfer URL: %w", err)
@@ -370,37 +371,24 @@ func parseUploadStreamSpec(args map[string]interface{}) (uploadStreamSpec, error
 	return spec, nil
 }
 
-func uploadWriteLock(uploadID string) *sync.Mutex {
-	uploadWriteLocksMu.Lock()
-	defer uploadWriteLocksMu.Unlock()
-	lock := uploadWriteLocks[uploadID]
-	if lock == nil {
-		lock = &sync.Mutex{}
-		uploadWriteLocks[uploadID] = lock
-	}
-	return lock
-}
-
-func forgetUploadWriteLock(uploadID string) {
-	if uploadID == "" {
-		return
-	}
-	uploadWriteLocksMu.Lock()
-	delete(uploadWriteLocks, uploadID)
-	uploadWriteLocksMu.Unlock()
-}
-
 func writeUploadStreamChunk(spec uploadStreamSpec, source io.Reader) (json.RawMessage, error) {
 	uploadChunksMu.Lock()
 	state, exists := uploadChunks[spec.UploadID]
 	if spec.First {
 		if !exists {
+			if err := checkUploadSessionCapacity(); err != nil {
+				uploadChunksMu.Unlock()
+				return nil, err
+			}
+			now := time.Now()
 			state = uploadChunkState{
 				ExpectedSize: spec.TotalSize,
 				ChunkSize:    spec.ChunkSize,
 				TargetPath:   spec.Path,
 				PartCount:    spec.ChunkCount,
 				Parts:        make(map[int64]struct{}),
+				CreatedAt:    now,
+				LastActivity: now,
 			}
 			partPath := uploadPartPathFor(spec.Path, spec.UploadID)
 			file, openErr := os.OpenFile(partPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
@@ -484,9 +472,16 @@ func writeUploadStreamChunk(spec uploadStreamSpec, source io.Reader) (json.RawMe
 	}
 	state.Parts[spec.ChunkIndex] = struct{}{}
 	state.TempPath = partPath
-	state.CreatedAt = time.Now()
+	// Refresh the idle clock on every chunk so the reaper only ever expires
+	// sessions the client has actually abandoned.
+	state.LastActivity = time.Now()
 	uploadChunks[spec.UploadID] = state
 	uploadChunksMu.Unlock()
+
+	if spec.First {
+		// Sweep part files a previous process abandoned for this same target.
+		removeStaleUploadParts(spec.Path, partPath, time.Now())
+	}
 
 	return json.Marshal(map[string]any{
 		"received": written,

@@ -56,6 +56,10 @@ type uploadChunkState struct {
 	PartCount    int64
 	TempPath     string
 	CreatedAt    time.Time
+	// LastActivity is refreshed for every chunk that lands. The idle reaper
+	// expires uploads by this timestamp, never by CreatedAt, so an upload that
+	// is still streaming is never reclaimed no matter how long it has run.
+	LastActivity time.Time
 }
 
 var (
@@ -628,12 +632,10 @@ func cancelFileUpload(args map[string]interface{}) (json.RawMessage, error) {
 	// the current chunk to drain.
 	cancelUploadStreams(uploadID)
 	waitUploadStreams(uploadID)
-	writeLock := uploadWriteLock(uploadID)
-	writeLock.Lock()
-	defer func() {
-		writeLock.Unlock()
-		forgetUploadWriteLock(uploadID)
-	}()
+	// The reference-counted guard keeps the lock entry alive for every waiter,
+	// so two finalizers for the same upload_id can never run in parallel.
+	writeGuard := acquireUploadWriteLock(uploadID)
+	defer writeGuard.release()
 	targetPath := argString(args, "path")
 	if targetPath != "" {
 		// Never normalise whitespace here: the path identifies a part file that
@@ -700,12 +702,10 @@ func commitFileUpload(args map[string]interface{}) (json.RawMessage, error) {
 	// Streams write independent offsets concurrently. Wait for every active
 	// stream before inspecting and renaming the part file.
 	waitUploadStreams(uploadID)
-	writeLock := uploadWriteLock(uploadID)
-	writeLock.Lock()
-	defer func() {
-		writeLock.Unlock()
-		forgetUploadWriteLock(uploadID)
-	}()
+	// The reference-counted guard keeps the lock entry alive for every waiter,
+	// so two finalizers for the same upload_id can never run in parallel.
+	writeGuard := acquireUploadWriteLock(uploadID)
+	defer writeGuard.release()
 
 	uploadChunksMu.Lock()
 	state, exists := uploadChunks[uploadID]

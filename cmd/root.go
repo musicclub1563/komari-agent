@@ -101,6 +101,12 @@ var RootCmd = &cobra.Command{
 				return fmt.Errorf("auto-discovery failed: %w", err)
 			}
 		}
+		// The token is the only credential the agent presents. The server decides
+		// whether to accept an empty one, but an operator should never discover
+		// afterwards that this host was reachable without a configured token.
+		if strings.TrimSpace(flags.Token) == "" {
+			log.Println("[warn] no API token configured; connecting with an empty token. Set --token, AGENT_TOKEN, or --auto-discovery.")
+		}
 		if err := pkg_flags.CaptureStartupConfig(map[string]interface{}{
 			"warning_panel_host":  warningPanelHost,
 			"warning_run_as_user": warningRunAsUser,
