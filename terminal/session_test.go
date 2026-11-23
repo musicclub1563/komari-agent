@@ -229,7 +229,7 @@ func TestCloseSessionUnblocksStalledInput(t *testing.T) {
 	}, "the write to reach the terminal")
 
 	start := time.Now()
-	closeSession("stall-close", session)
+	closeSession("stall-close", session, false)
 	elapsed := time.Since(start)
 
 	if elapsed > 2*time.Second {
@@ -310,12 +310,12 @@ func TestCloseSessionIsIdempotentUnderConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			closeSession("concurrent-close", session)
+			closeSession("concurrent-close", session, false)
 		}()
 	}
 	wg.Wait()
 	// 关闭后再次关闭同样必须是空操作。
-	closeSession("concurrent-close", session)
+	closeSession("concurrent-close", session, false)
 
 	writes, _, _, closeCalls := fake.snapshot()
 	if closeCalls != 1 {
@@ -497,7 +497,7 @@ func TestDetachKeepsSessionAndOldConnectionCannotKillNewOne(t *testing.T) {
 		t.Fatal("detached session must be kept for reattachment")
 	}
 
-	reattached, firstConnection, err := acquireSession("reattach", newClient)
+	reattached, firstConnection, err := acquireSession("reattach", newClient, true)
 	if err != nil {
 		t.Fatalf("acquireSession: %v", err)
 	}

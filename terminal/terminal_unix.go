@@ -147,6 +147,11 @@ func (t *unixTerminal) Close() error {
 }
 
 func (t *unixTerminal) shutdown() error {
+	defer func() {
+		if t.tty != nil {
+			_ = t.tty.Close()
+		}
+	}()
 	if t.cmd == nil || t.cmd.Process == nil {
 		_ = t.closeTTY()
 		return fmt.Errorf("terminal process is already nil or not started")
